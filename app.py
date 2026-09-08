@@ -9,9 +9,53 @@ import re
 import logging
 import socket
 import asyncio
+import uuid
+import json
+import sys
+import contextvars
 from contextlib import asynccontextmanager
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# ---- structured logging with request_id ----
+request_id_ctx = contextvars.ContextVar("request_id", default="-")
+LOG_FORMAT = os.getenv("LOG_FORMAT", "text")  # text or json
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+
+class RequestIdFilter(logging.Filter):
+    def filter(self, record):
+        record.request_id = request_id_ctx.get()
+        return True
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record):
+        log = {
+            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
+            "level": record.levelname,
+            "rid": getattr(record, "request_id", "-"),
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        if record.exc_info and record.exc_info[0] is not None:
+            log["exc"] = self.formatException(record.exc_info)
+        return json.dumps(log, ensure_ascii=False)
+
+def setup_logging():
+    level = getattr(logging, LOG_LEVEL.upper(), logging.INFO)
+    handler = logging.StreamHandler(sys.stdout)
+    handler.addFilter(RequestIdFilter())
+    if LOG_FORMAT == "json":
+        handler.setFormatter(JsonFormatter())
+    else:
+        handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] [%(request_id)s] %(message)s"))
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.addHandler(handler)
+    root.setLevel(level)
+    # quiet noisy libs
+    logging.getLogger("uvicorn.access").handlers.clear()
+    logging.getLogger("uvicorn.access").addHandler(handler)
+    logging.getLogger("uvicorn.access").propagate = False
+
+setup_logging()
 logger = logging.getLogger("razorpay-headless")
 
 # Global browser pool for high performance (reuse, not launch per request)
@@ -50,6 +94,34 @@ app = FastAPI(
 )
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+# ---- request_id + access log middleware ----
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    rid = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:8]
+    request_id_ctx.set(rid)
+    start = time.time()
+    # attach rid to request state for later use
+    request.state.rid = rid
+    # log incoming (skip health noise if LOG_LEVEL=INFO, keep as DEBUG)
+    if request.url.path not in ("/", "/health"):
+        logger.info(f"-> {request.method} {request.url.path} rid={rid} ip={request.client.host if request.client else '-'}")
+    else:
+        logger.debug(f"-> {request.method} {request.url.path} rid={rid}")
+    try:
+        response = await call_next(request)
+    except Exception as e:
+        elapsed_ms = int((time.time() - start) * 1000)
+        logger.exception(f"<- {request.method} {request.url.path} rid={rid} err={e} elapsed={elapsed_ms}ms")
+        raise
+    elapsed_ms = int((time.time() - start) * 1000)
+    response.headers["X-Request-ID"] = rid
+    # structured access log: single line per request with status + elapsed
+    if request.url.path not in ("/", "/health"):
+        logger.info(f"<- {request.method} {request.url.path} rid={rid} status={response.status_code} elapsed={elapsed_ms}ms")
+    else:
+        logger.debug(f"<- {request.method} {request.url.path} rid={rid} status={response.status_code} elapsed={elapsed_ms}ms")
+    return response
 
 class PayRequest(BaseModel):
     order_id: str = Field(..., description="Razorpay order_id starting with order_", json_schema_extra={"example": "order_TXXMi5sObbpm2X"})
@@ -90,13 +162,15 @@ class ValidationErrorResponse(BaseModel):
 
 @app.exception_handler(HTTPException)
 async def http_exc_handler(request: Request, exc: HTTPException):
-    logger.error(f"HTTP {exc.status_code} on {request.url.path}: {exc.detail}")
-    return JSONResponse(status_code=exc.status_code, content={"status": "error", "detail": exc.detail, "code": exc.status_code})
+    rid = getattr(request.state, "rid", request_id_ctx.get())
+    logger.error(f"HTTP {exc.status_code} on {request.url.path} rid={rid}: {exc.detail}")
+    return JSONResponse(status_code=exc.status_code, content={"status": "error", "detail": exc.detail, "code": exc.status_code, "request_id": rid})
 
 @app.exception_handler(Exception)
 async def generic_exc_handler(request: Request, exc: Exception):
-    logger.exception(f"Unhandled error on {request.url.path}: {exc}")
-    return JSONResponse(status_code=500, content={"status": "error", "detail": "Internal server error", "code": 500})
+    rid = getattr(request.state, "rid", request_id_ctx.get())
+    logger.exception(f"Unhandled error on {request.url.path} rid={rid}: {exc}")
+    return JSONResponse(status_code=500, content={"status": "error", "detail": "Internal server error", "code": 500, "request_id": rid})
 
 def _get_local_ip():
     try:
@@ -112,16 +186,22 @@ def _get_local_ip():
 async def startup_event():
     port = int(os.getenv("PORT", "8000"))
     local_ip = _get_local_ip()
+    max_conc = os.getenv("MAX_CONCURRENCY", "5")
+    logger.info(f"Startup port={port} host=0.0.0.0 concurrency={max_conc} log_format={LOG_FORMAT} log_level={LOG_LEVEL}")
     logger.info(f"Local:    http://127.0.0.1:{port}")
     logger.info(f"Network:  http://{local_ip}:{port}")
-    logger.info(f"External: http://0.0.0.0:{port}")
-    print(f"\n{'='*60}\n Razorpay Headless API (High-Perf, Headless, Pooled)\n  Local:    http://127.0.0.1:{port}\n  Network:  http://{local_ip}:{port}\n  External: http://0.0.0.0:{port}\n  Docs:     http://127.0.0.1:{port}/docs\n  Pool: 5 concurrent | Browser reused | Async\n{'='*60}\n")
+    logger.info(f"External: http://0.0.0.0:{port} docs=/docs pool={max_conc} headless=True")
 
 async def generate_pay_id_async(order_id: str, key: str, amount: int, currency: str = "INR", timeout: int = 90):
+    rid = request_id_ctx.get()
+    order_suffix = order_id[-6:] if len(order_id) > 6 else order_id
     if not order_id.startswith("order_"):
+        logger.warning(f"[{rid}] validation fail order={order_suffix} reason=order_id must start with order_")
         raise HTTPException(status_code=400, detail="Invalid order_id, must start with order_")
     if amount <= 0:
+        logger.warning(f"[{rid}] validation fail order={order_suffix} amount={amount}")
         raise HTTPException(status_code=400, detail="Invalid amount")
+    logger.info(f"[{rid}] start order=*{order_suffix} amount={amount} timeout={timeout}s key={key[:8]}.. currency={currency}")
 
     html = f"""<!DOCTYPE html><html><head><title>Hoora</title>
 <script src="https://checkout.razorpay.com/v1/checkout.js"></script></head><body>
@@ -150,20 +230,28 @@ window.addEventListener("load",function(){{setTimeout(()=>{{try{{new Razorpay(op
             start = time.time()
             ctx = None
             page = None
+            loop_iter = 0
             try:
-                logger.info(f"[Attempt {attempt}/1] {order_id} amount={amount} timeout={timeout}s (headless=True, pooled, single)")
+                logger.info(f"[{rid}] attempt {attempt}/1 order=*{order_suffix} amount={amount} timeout={timeout}s pooled={browser is not None}")
                 ctx = await browser.new_context(viewport={"width":1280,"height":720}, user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
                 page = await ctx.new_page()
+                logger.debug(f"[{rid}] page created, set_content start elapsed={(time.time()-start):.1f}s")
                 await page.set_content(html, wait_until="domcontentloaded", timeout=30000)
                 try:
                     await page.wait_for_selector("iframe[src*='razorpay']", timeout=20000)
-                except Exception:
+                    logger.debug(f"[{rid}] iframe found elapsed={(time.time()-start):.1f}s")
+                except Exception as e:
+                    logger.debug(f"[{rid}] iframe wait timeout elapsed={(time.time()-start):.1f}s err={e}")
                     await asyncio.sleep(3)
                 await asyncio.sleep(2)
 
                 pay_id = None
                 signature = "mock"
                 while time.time() - start < timeout:
+                    loop_iter += 1
+                    elapsed = time.time() - start
+                    if loop_iter % 10 == 1:
+                        logger.debug(f"[{rid}] loop iter={loop_iter} elapsed={elapsed:.1f}s/{timeout}s frames={len(page.frames)}")
                     try:
                         res = await page.evaluate("window.razorpayResult")
                         if res and res.get("razorpay_payment_id"):
@@ -262,7 +350,7 @@ window.addEventListener("load",function(){{setTimeout(()=>{{try{{new Razorpay(op
                                                 if pay_id:
                                                     break
                                         except Exception as e:
-                                            logger.warning(f"Popup err (slow net): {e}")
+                                            logger.warning(f"[{rid}] popup err elapsed={(time.time()-start):.1f}s: {e}")
                             except Exception:
                                 continue
                     except Exception:
@@ -271,17 +359,27 @@ window.addEventListener("load",function(){{setTimeout(()=>{{try{{new Razorpay(op
                         break
                     await asyncio.sleep(1)
 
-                await ctx.close()
+                try:
+                    await ctx.close()
+                except Exception:
+                    pass
                 if pay_id:
                     elapsed_ms = int((time.time() - start)*1000)
-                    logger.info(f"Success pay_id={pay_id} elapsed={elapsed_ms}ms attempt={attempt} (headless, pooled)")
+                    logger.info(f"[{rid}] success pay_id={pay_id} order=*{order_suffix} elapsed={elapsed_ms}ms iter={loop_iter} attempt={attempt}")
                     if own_browser:
-                        await browser.close()
+                        try: await browser.close()
+                        except Exception: pass
                     return {"pay_id": pay_id, "order_id": order_id, "signature": signature, "elapsed_ms": elapsed_ms}
                 else:
-                    last_err = f"Timeout {timeout}s single attempt"
-                    logger.warning(last_err)
-                    await ctx.close()
+                    actual = time.time() - start
+                    last_err = f"Timeout {timeout}s single attempt (actual {actual:.1f}s, iter={loop_iter})"
+                    logger.warning(f"[{rid}] {last_err} order=*{order_suffix}")
+                    try:
+                        # dump last page state for debugging (truncated)
+                        content_snip = (await page.content())[:500] if 'page' in locals() and page else ""
+                        logger.debug(f"[{rid}] timeout page_snip={content_snip[:200]}")
+                    except Exception:
+                        pass
                     raise HTTPException(status_code=500, detail=f"Failed single attempt: {last_err}")
             except HTTPException:
                 if ctx:
@@ -289,10 +387,11 @@ window.addEventListener("load",function(){{setTimeout(()=>{{try{{new Razorpay(op
                     except Exception: pass
                 raise
             except Exception as e:
+                actual = time.time() - start
+                logger.warning(f"[{rid}] single attempt failed after {actual:.1f}s iter={loop_iter}: {e}", exc_info=True)
                 if ctx:
                     try: await ctx.close()
                     except Exception: pass
-                logger.warning(f"Single attempt failed: {e}")
                 raise HTTPException(status_code=500, detail=f"Headless failed (single attempt): {str(e)}")
             finally:
                 if own_browser and browser:
@@ -324,5 +423,5 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
     host = os.getenv("HOST", "0.0.0.0")
-    print(f"\n{'='*60}\n Razorpay Headless API (High-Perf, Headless, Pooled, Async)\n  Local:    http://127.0.0.1:{port}\n  Network:  http://{_get_local_ip()}:{port}\n  External: http://0.0.0.0:{port}\n  Docs:     http://127.0.0.1:{port}/docs\n  Pool: 5 concurrent | Async | Headless=True\n{'='*60}\n")
-    uvicorn.run(app, host=host, port=port, log_level="info", access_log=True)
+    logger.info(f"Starting via __main__ host={host} port={port}")
+    uvicorn.run(app, host=host, port=port, log_level="info", access_log=False)
