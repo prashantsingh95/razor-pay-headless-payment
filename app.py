@@ -236,14 +236,26 @@ window.addEventListener("load",function(){{setTimeout(()=>{{try{{new Razorpay(op
                 ctx = await browser.new_context(viewport={"width":1280,"height":720}, user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
                 page = await ctx.new_page()
                 logger.debug(f"[{rid}] page created, set_content start elapsed={(time.time()-start):.1f}s")
-                await page.set_content(html, wait_until="domcontentloaded", timeout=30000)
+                # Use commit (not domcontentloaded) - checkout.js would block domcontentloaded for 5-15s
                 try:
-                    await page.wait_for_selector("iframe[src*='razorpay']", timeout=20000)
+                    await page.set_content(html, wait_until="commit", timeout=10000)
+                    logger.debug(f"[{rid}] set_content commit done elapsed={(time.time()-start):.1f}s")
+                except Exception as e:
+                    logger.warning(f"[{rid}] set_content commit failed elapsed={(time.time()-start):.1f}s err={e}")
+                    raise
+                # wait for checkout.js to load (Razorpay function)
+                try:
+                    await page.wait_for_function("typeof Razorpay !== 'undefined'", timeout=10000)
+                    logger.debug(f"[{rid}] Razorpay loaded elapsed={(time.time()-start):.1f}s")
+                except Exception as e:
+                    logger.warning(f"[{rid}] Razorpay not loaded after 10s elapsed={(time.time()-start):.1f}s err={e}")
+                # give checkout time to open iframe (Razorpay.open called on window.load +800ms in html)
+                try:
+                    await page.wait_for_selector("iframe[src*='razorpay']", timeout=10000)
                     logger.debug(f"[{rid}] iframe found elapsed={(time.time()-start):.1f}s")
                 except Exception as e:
                     logger.debug(f"[{rid}] iframe wait timeout elapsed={(time.time()-start):.1f}s err={e}")
-                    await asyncio.sleep(3)
-                await asyncio.sleep(2)
+                    await asyncio.sleep(1)
 
                 pay_id = None
                 signature = "mock"
