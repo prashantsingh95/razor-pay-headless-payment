@@ -337,7 +337,7 @@ window.addEventListener("load",function(){{setTimeout(()=>{{try{{new Razorpay(op
                                 if tel and await tel.is_visible():
                                     placeholder = await tel.get_attribute("placeholder") or ""
                                     if "mobile" in placeholder.lower() or placeholder == "":
-                                        await tel.fill("9000090000")
+                                        await tel.fill(os.getenv("TEST_MOBILE", "9000090000"))
                                         await asyncio.sleep(0.8)
                                         btn = await frame.query_selector("button:has-text('Continue')")
                                         if btn and await btn.is_visible():

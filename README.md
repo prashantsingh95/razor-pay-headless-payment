@@ -2,7 +2,7 @@
 
 FastAPI service that generates `pay_xxx` via headless Razorpay checkout (no UI).
 
-**Flow:** `order_id` + `amount` -> headless Chromium -> fill mobile `9000090000` -> Netbanking -> HDFC -> Success -> `pay_id`
+**Flow:** `order_id` + `amount` -> headless Chromium -> fill mobile `TEST_MOBILE` (`9000090000` dummy, or `TEST_MOBILE` env) -> Netbanking -> HDFC -> Success -> `pay_id`
 
 ## Install
 ```bash
