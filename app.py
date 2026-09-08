@@ -160,6 +160,22 @@ class ErrorResponse(BaseModel):
 class ValidationErrorResponse(BaseModel):
     detail: list = Field(example=[{"loc": ["body", "order_id"], "msg": "Field required", "type": "missing"}])
 
+class CreateOrderRequest(BaseModel):
+    amount: int = Field(..., description="Amount in paise (399900 = ₹3999)", json_schema_extra={"example": 399900})
+    currency: Optional[str] = Field(default="INR", json_schema_extra={"example": "INR"})
+    receipt: Optional[str] = Field(default=None, description="Receipt id (auto-generated if null)", json_schema_extra={"example": "rcpt_123"})
+    key_id: Optional[str] = Field(default=None, description="Razorpay key_id (or set RAZORPAY_KEY_ID env)", json_schema_extra={"example": "rzp_test_Msze6ygmQKtjXy"})
+    key_secret: Optional[str] = Field(default=None, description="Razorpay key_secret (or set RAZORPAY_KEY_SECRET env)", json_schema_extra={"example": "your_secret"})
+    model_config = {"json_schema_extra": {"example": {"amount": 399900, "currency": "INR", "receipt": "rcpt_test"}}}
+
+class CreateOrderResponse(BaseModel):
+    order_id: str = Field(..., json_schema_extra={"example": "order_TXXMi5sObbpm2X"})
+    amount: int = Field(..., json_schema_extra={"example": 399900})
+    currency: str = Field(..., json_schema_extra={"example": "INR"})
+    receipt: str = Field(..., json_schema_extra={"example": "rcpt_123"})
+    status: str = Field(..., json_schema_extra={"example": "created"})
+    raw: dict = Field(default={}, description="Full Razorpay response")
+
 @app.exception_handler(HTTPException)
 async def http_exc_handler(request: Request, exc: HTTPException):
     rid = getattr(request.state, "rid", request_id_ctx.get())
@@ -236,26 +252,36 @@ window.addEventListener("load",function(){{setTimeout(()=>{{try{{new Razorpay(op
                 ctx = await browser.new_context(viewport={"width":1280,"height":720}, user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
                 page = await ctx.new_page()
                 logger.debug(f"[{rid}] page created, set_content start elapsed={(time.time()-start):.1f}s")
-                # Use commit (not domcontentloaded) - checkout.js would block domcontentloaded for 5-15s
+                # Initial working logic: domcontentloaded 30s (Render network fast, loads Razorpay)
+                # Fallback to commit if domcontentloaded times out (local slow network)
                 try:
-                    await page.set_content(html, wait_until="commit", timeout=10000)
-                    logger.debug(f"[{rid}] set_content commit done elapsed={(time.time()-start):.1f}s")
+                    await page.set_content(html, wait_until="domcontentloaded", timeout=30000)
+                    logger.debug(f"[{rid}] set_content domcontentloaded done elapsed={(time.time()-start):.1f}s")
                 except Exception as e:
-                    logger.warning(f"[{rid}] set_content commit failed elapsed={(time.time()-start):.1f}s err={e}")
-                    raise
-                # wait for checkout.js to load (Razorpay function)
+                    logger.warning(f"[{rid}] set_content domcontentloaded timeout elapsed={(time.time()-start):.1f}s err={e} - fallback commit")
+                    try:
+                        await page.set_content(html, wait_until="commit", timeout=10000)
+                        logger.debug(f"[{rid}] set_content commit fallback done elapsed={(time.time()-start):.1f}s")
+                        # after commit, wait for Razorpay to load
+                        try:
+                            await page.wait_for_function("typeof Razorpay !== 'undefined'", timeout=8000)
+                            logger.debug(f"[{rid}] Razorpay loaded after commit fallback elapsed={(time.time()-start):.1f}s")
+                        except Exception as e2:
+                            logger.debug(f"[{rid}] Razorpay not loaded after fallback {e2}")
+                    except Exception as e2:
+                        logger.warning(f"[{rid}] set_content commit fallback failed {e2}")
                 try:
-                    await page.wait_for_function("typeof Razorpay !== 'undefined'", timeout=10000)
-                    logger.debug(f"[{rid}] Razorpay loaded elapsed={(time.time()-start):.1f}s")
-                except Exception as e:
-                    logger.warning(f"[{rid}] Razorpay not loaded after 10s elapsed={(time.time()-start):.1f}s err={e}")
-                # give checkout time to open iframe (Razorpay.open called on window.load +800ms in html)
-                try:
-                    await page.wait_for_selector("iframe[src*='razorpay']", timeout=10000)
+                    await page.wait_for_selector("iframe[src*='razorpay']", timeout=20000)
                     logger.debug(f"[{rid}] iframe found elapsed={(time.time()-start):.1f}s")
                 except Exception as e:
                     logger.debug(f"[{rid}] iframe wait timeout elapsed={(time.time()-start):.1f}s err={e}")
-                    await asyncio.sleep(1)
+                    try:
+                        has_rzp = await page.evaluate("typeof Razorpay !== 'undefined'")
+                        logger.debug(f"[{rid}] Razorpay loaded={has_rzp} elapsed={(time.time()-start):.1f}s")
+                    except Exception:
+                        pass
+                    await asyncio.sleep(3)
+                await asyncio.sleep(2)
 
                 pay_id = None
                 signature = "mock"
@@ -430,6 +456,43 @@ async def generate_pay_id(req: PayRequest):
 @app.post("/pay", response_model=PayResponse, tags=["Payment"], summary="Alias for /generate-pay-id")
 async def pay(req: PayRequest):
     return await generate_pay_id(req)
+
+@app.post("/create-order", response_model=CreateOrderResponse, tags=["Order"], summary="Create Razorpay order (for real pay_id test)", description="Calls https://api.razorpay.com/v1/orders with Basic Auth. Provide key_id/key_secret in body or set RAZORPAY_KEY_ID/RAZORPAY_KEY_SECRET env. Returns order_id for /generate-pay-id.")
+async def create_order(req: CreateOrderRequest, request: Request):
+    rid = getattr(request.state, "rid", request_id_ctx.get())
+    import httpx
+    key_id = req.key_id or os.getenv("RAZORPAY_KEY_ID") or "rzp_test_Msze6ygmQKtjXy"
+    key_secret = req.key_secret or os.getenv("RAZORPAY_KEY_SECRET")
+    if not key_secret:
+        logger.warning(f"[{rid}] create-order missing key_secret")
+        raise HTTPException(status_code=400, detail="key_secret required: pass in body or set RAZORPAY_KEY_SECRET env (find at https://dashboard.razorpay.com/app/keys)")
+    if req.amount <= 0:
+        raise HTTPException(status_code=400, detail="Invalid amount")
+    receipt = req.receipt or f"rcpt_{uuid.uuid4().hex[:8]}"
+    logger.info(f"[{rid}] create-order amount={req.amount} currency={req.currency} receipt={receipt} key={key_id[:8]}..")
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.post(
+                "https://api.razorpay.com/v1/orders",
+                auth=(key_id, key_secret),
+                json={"amount": req.amount, "currency": req.currency, "receipt": receipt}
+            )
+            logger.info(f"[{rid}] razorpay orders status={resp.status_code}")
+            if resp.status_code not in (200, 201):
+                logger.error(f"[{rid}] razorpay error {resp.status_code}: {resp.text[:500]}")
+                raise HTTPException(status_code=resp.status_code, detail=f"Razorpay API error: {resp.text[:500]}")
+            data = resp.json()
+            order_id = data.get("id")
+            if not order_id or not order_id.startswith("order_"):
+                logger.error(f"[{rid}] unexpected razorpay resp {data}")
+                raise HTTPException(status_code=500, detail=f"Unexpected Razorpay response: {data}")
+            logger.info(f"[{rid}] order created {order_id} amount={data.get('amount')}")
+            return CreateOrderResponse(order_id=order_id, amount=data.get("amount", req.amount), currency=data.get("currency", req.currency), receipt=data.get("receipt", receipt), status=data.get("status", "created"), raw=data)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"[{rid}] create-order failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Create order failed: {e}")
 
 if __name__ == "__main__":
     import uvicorn
