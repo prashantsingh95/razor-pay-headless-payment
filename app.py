@@ -494,6 +494,38 @@ async def create_order(req: CreateOrderRequest, request: Request):
         logger.exception(f"[{rid}] create-order failed: {e}")
         raise HTTPException(status_code=500, detail=f"Create order failed: {e}")
 
+class CronRequest(BaseModel):
+    order_id: Optional[str] = Field(default=None, description="Optional single order_id to process; if null, uses queue/mock")
+    amount: Optional[int] = Field(default=399900, json_schema_extra={"example": 399900})
+    count: Optional[int] = Field(default=1, ge=1, le=10, description="How many to process (1-10)")
+
+@app.get("/cron/health", tags=["Cron"], summary="Cron warmup & pool check (idempotent)")
+async def cron_health(request: Request):
+    rid = getattr(request.state, "rid", request_id_ctx.get())
+    secret = request.headers.get("X-Cron-Secret") or request.query_params.get("secret")
+    expected = os.getenv("CRON_SECRET")
+    if expected and secret != expected:
+        raise HTTPException(status_code=401, detail="Invalid cron secret")
+    pool_ok = browser_pool is not None
+    logger.info(f"[{rid}] cron health pool_ok={pool_ok}")
+    return {"status": "ok", "pool_ok": pool_ok, "service": "razorpay-headless", "rid": rid, "time": int(time.time())}
+
+@app.post("/cron/generate", tags=["Cron"], summary="Cron job: generate pay_id(s) (for queue/cron)")
+async def cron_generate(req: CronRequest, request: Request):
+    rid = getattr(request.state, "rid", request_id_ctx.get())
+    secret = request.headers.get("X-Cron-Secret") or request.query_params.get("secret")
+    expected = os.getenv("CRON_SECRET")
+    if expected and secret != expected:
+        raise HTTPException(status_code=401, detail="Invalid cron secret")
+    # If no order_id, just warmup pool
+    if not req.order_id:
+        pool_ok = browser_pool is not None
+        logger.info(f"[{rid}] cron warmup pool_ok={pool_ok} count={req.count}")
+        return {"status": "warmup", "pool_ok": pool_ok, "count": req.count, "rid": rid}
+    result = await generate_pay_id_async(req.order_id, os.getenv("RAZORPAY_KEY_ID", "rzp_test_Msze6ygmQKtjXy"), req.amount or 399900, "INR", 90)
+    logger.info(f"[{rid}] cron generate done pay_id={result['pay_id']} order={req.order_id}")
+    return {"status": "success", "pay_id": result["pay_id"], "order_id": req.order_id, "elapsed_ms": result["elapsed_ms"], "rid": rid}
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
