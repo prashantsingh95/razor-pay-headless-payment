@@ -502,21 +502,21 @@ class CronRequest(BaseModel):
 @app.get("/cron/health", tags=["Cron"], summary="Cron warmup & pool check (idempotent)")
 async def cron_health(request: Request):
     rid = getattr(request.state, "rid", request_id_ctx.get())
-    secret = request.headers.get("X-Cron-Secret") or request.query_params.get("secret")
-    expected = os.getenv("CRON_SECRET")
-    if expected and secret != expected:
-        raise HTTPException(status_code=401, detail="Invalid cron secret")
+    # No auth required — always 200 when hit (Render cron / uptime checks)
     pool_ok = browser_pool is not None
-    logger.info(f"[{rid}] cron health pool_ok={pool_ok}")
+    logger.info(f"[{rid}] cron health pool_ok={pool_ok} ip={request.client.host if request.client else '-'}")
     return {"status": "ok", "pool_ok": pool_ok, "service": "razorpay-headless", "rid": rid, "time": int(time.time())}
 
 @app.post("/cron/generate", tags=["Cron"], summary="Cron job: generate pay_id(s) (for queue/cron)")
 async def cron_generate(req: CronRequest, request: Request):
     rid = getattr(request.state, "rid", request_id_ctx.get())
-    secret = request.headers.get("X-Cron-Secret") or request.query_params.get("secret")
+    # Optional secret check — but always allow if CRON_SECRET not set or missing, to return 200 for cron hits
     expected = os.getenv("CRON_SECRET")
-    if expected and secret != expected:
-        raise HTTPException(status_code=401, detail="Invalid cron secret")
+    if expected:
+        secret = request.headers.get("X-Cron-Secret") or request.query_params.get("secret")
+        if secret and secret != expected:
+            raise HTTPException(status_code=401, detail="Invalid cron secret")
+        # if secret is None/empty, allow (return 200) — per user request
     # If no order_id, just warmup pool
     if not req.order_id:
         pool_ok = browser_pool is not None

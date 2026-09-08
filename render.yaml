@@ -12,8 +12,6 @@ services:
         sync: false
       - key: HOST
         value: 0.0.0.0
-      - key: CRON_SECRET
-        generateValue: true
       - key: LOG_FORMAT
         value: text
       # Optional: increase workers/timeout if needed
@@ -24,12 +22,7 @@ services:
     env: python
     schedule: "*/15 * * * *"  # every 15 min keep browser warm (Render free sleeps)
     buildCommand: pip install httpx
-    startCommand: python -c "import os,httpx; url=os.getenv('WEB_URL','https://razor-pay-headless-payment.onrender.com')+'/cron/health?secret='+os.getenv('CRON_SECRET',''); print(httpx.get(url, timeout=10).text)"
+    startCommand: python -c "import os,httpx; url=os.getenv('WEB_URL','https://razor-pay-headless-payment.onrender.com')+'/cron/health'; print(httpx.get(url, timeout=10).text)"
     envVars:
       - key: WEB_URL
         value: https://razor-pay-headless-payment.onrender.com
-      - key: CRON_SECRET
-        fromService:
-          name: razorpay-headless-api
-          type: web
-          property: CRON_SECRET
