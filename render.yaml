@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: razorpay-headless-api
+    env: python
+    # Render auto-detects Python 3.11; override via PYTHON_VERSION if needed
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt && python -m playwright install --with-deps chromium
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /
+    autoDeploy: false
+    envVars:
+      - key: PORT
+        sync: false
+      - key: HOST
+        value: 0.0.0.0
+      # Optional: increase workers/timeout if needed
+      # - key: PYTHON_VERSION
+      #   value: 3.11.0

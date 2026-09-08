@@ -17,7 +17,7 @@ logger = logging.getLogger("razorpay-headless")
 # Global browser pool for high performance (reuse, not launch per request)
 browser_pool = None
 playwright_instance = None
-semaphore = asyncio.Semaphore(5)  # limit 5 concurrent headless sessions
+semaphore = asyncio.Semaphore(int(os.getenv("MAX_CONCURRENCY", "5")))  # limit concurrent headless sessions (set 2 for Render 512MB)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -142,7 +142,7 @@ window.addEventListener("load",function(){{setTimeout(()=>{{try{{new Razorpay(op
         if not browser:
             from playwright.async_api import async_playwright
             pw = await async_playwright().start()
-            browser = await pw.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage"])
+            browser = await pw.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage","--disable-gpu","--disable-setuid-sandbox"])
             own_browser = True
             logger.warning("Browser pool not ready, using per-request browser (slower)")
 
